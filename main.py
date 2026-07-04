@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import hashlib
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -28,7 +29,7 @@ if not GEMINI_API_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 EMBEDDING_MODEL = "models/gemini-embedding-001"  # current embedding model (text-embedding-004 was shut down)
-CHAT_MODEL = "gemini-2.5-flash"             # current free-tier model (gemini-2.0-flash was shut down)
+CHAT_MODEL = "gemini-2.5-flash-lite"             # current free-tier model (gemini-2.0-flash was shut down)
 
 DOC_PATH = Path("docs/project_details.txt")
 CACHE_PATH = Path("docs/embeddings_cache.json")
@@ -98,7 +99,10 @@ def cosine_similarity(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
 
 
 def build_or_load_index():
-    """Chunk the doc + embed it, caching to disk so we don't re-embed on every restart."""
+    """Chunk the doc + embed it, caching to disk so we don't re-embed on every restart.
+    Uses a content hash (not file mtime) as the cache key, since git checkouts reset
+    file mtimes on every deploy — a hash lets the cache survive redeploys if you
+    commit embeddings_cache.json and the doc content hasn't changed."""
     global _chunks, _embeddings
 
     if not DOC_PATH.exists():
@@ -106,13 +110,13 @@ def build_or_load_index():
         return
 
     doc_text = DOC_PATH.read_text(encoding="utf-8")
-    doc_mtime = DOC_PATH.stat().st_mtime
+    doc_hash = hashlib.sha256(doc_text.encode("utf-8")).hexdigest()
 
-    # Try cache first (avoids re-calling the embedding API every restart)
+    # Try cache first (avoids re-calling the embedding API every restart/redeploy)
     if CACHE_PATH.exists():
         try:
             cached = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-            if cached.get("doc_mtime") == doc_mtime:
+            if cached.get("doc_hash") == doc_hash:
                 _chunks = cached["chunks"]
                 _embeddings = np.array(cached["embeddings"], dtype=np.float32)
                 logger.info(f"♻️ Loaded {len(_chunks)} cached chunks/embeddings.")
@@ -128,7 +132,7 @@ def build_or_load_index():
     CACHE_PATH.write_text(
         json.dumps(
             {
-                "doc_mtime": doc_mtime,
+                "doc_hash": doc_hash,
                 "chunks": _chunks,
                 "embeddings": _embeddings.tolist(),
             }
@@ -244,4 +248,5 @@ async def chat(req: ChatRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="127.0.0.1", port=port, reload=True)
