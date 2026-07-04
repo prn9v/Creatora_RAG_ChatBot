@@ -1,0 +1,769 @@
+================================================================================
+CREATORA — COMPLETE PRODUCT & FEATURE DOCUMENTATION
+================================================================================
+Purpose of this document: This document is written to be used as a knowledge
+base for training/grounding a Retrieval-Augmented Generation (RAG) chatbot
+that answers user questions about the Creatora website/product. It describes
+every feature, screen, API endpoint, and workflow found in the actual source
+code of the project (both backend and frontend repositories) as of the
+analysis date. Where the marketing/landing page describes something that is
+NOT actually implemented in the working code (e.g., mock/demo data), this is
+explicitly flagged as "NOT LIVE / MOCK DATA" so the chatbot never tells a user
+that a fake feature is real.
+
+Sources analyzed:
+- Backend repository: https://github.com/prn9v/Creatora-Backend (NestJS + Prisma + PostgreSQL)
+- Frontend repository: https://github.com/prn9v/Creatora-Frontend (Next.js 16 / React 19)
+- Live backend: https://creatora-backend.onrender.com (Swagger docs at /docs)
+- Live frontend: https://creatora-frontend.vercel.app/
+
+================================================================================
+1. WHAT IS CREATORA?
+================================================================================
+Creatora is an AI-powered content creation platform built for individual
+content creators, influencers, and small brands. Its core promise is:
+"Learn your unique writing voice from your past content, then generate new,
+on-brand social media posts, video scripts, content ideas, and a weekly
+posting calendar that all sound authentically like you — not like generic
+AI output."
+
+The product is split into two parts:
+1. A NestJS REST API backend that handles authentication, data storage,
+   web-scraping of past social posts, AI analysis (via Google Gemini), and
+   AI content generation (via Gemini and an external FastAPI microservice).
+2. A Next.js frontend (React 19, Tailwind CSS, shadcn/ui-style components)
+   that provides the onboarding flow and the day-to-day creator dashboard.
+
+================================================================================
+2. HIGH-LEVEL USER JOURNEY
+================================================================================
+1. Visitor lands on the marketing homepage (Hero, Features, How-It-Works,
+   Pricing, CTA sections).
+2. User signs up (email + password) or logs in.
+3. First-time users are guided through a two-step ONBOARDING flow:
+   Step 1 — Brand Setup: choose brand tone, niche, and target audience.
+   Step 2 — Past Post Upload: paste URLs of at least 3 real past posts from
+   different platforms (Twitter/X, LinkedIn, Instagram, Blog, Newsletter,
+   X Thread). Each URL is scraped and analyzed individually. Once at least
+   3 posts are successfully analyzed, the user clicks "Analyze & Train AI",
+   which triggers a writing-style analysis that builds their personal
+   "Brand Profile" (their AI voice model).
+4. After onboarding, the user lands on the main Dashboard, and from there
+   can use the following authenticated tools via the left-hand sidebar:
+   - Dashboard (overview/stats)
+   - Content Ideas (AI + trending idea generation)
+   - Generate Post (single Instagram-style post + video script + schedule)
+   - Generated Posts (history/library of everything generated)
+   - Weekly Planner (drag-and-drop style weekly content calendar)
+   - Profile (personal settings)
+   - Account (billing/plan — currently mock data, see section 8)
+
+================================================================================
+3. AUTHENTICATION & ACCOUNT MANAGEMENT
+================================================================================
+Backend module: `src/auth` (NestJS controller: `AuthController`,
+route prefix: `/v1/users/auth`)
+
+Features:
+- Sign Up: email, password (min 6 characters), optional display name.
+  Passwords are hashed using Node's built-in `scrypt` algorithm with a
+  random salt (format: `hash.salt`), NOT bcrypt.
+- Log In: email + password. On success, a JWT access token is issued and
+  set as an HTTP-only, secure, SameSite=None cookie named `access_token`
+  (1 hour expiry). The response body also returns basic user info
+  (id, email, plan, name) and `success: true`.
+- Get Current User ("Me"): `GET /v1/users/auth/me` — requires a valid JWT
+  cookie. Returns full user profile including brand profile, past posts,
+  generated posts, content ideas, and weekly plans.
+- Refresh Token: `POST /v1/users/auth/refresh-token` — issues a new JWT
+  cookie for the currently authenticated user.
+- Update Password: `PUT /v1/users/auth/update-password` — requires current
+  password, new password, and confirmation. Rejects if the new password is
+  the same as the old one, or if confirmation doesn't match.
+- Forgot Password: `POST /v1/users/auth/forgot-password` — generates a
+  6-digit OTP (numeric), valid for 15 minutes, and emails it to the user via
+  the Brevo transactional email API ("Creatora Password Reset Verification
+  Code" email template).
+- Reset Password: `POST /v1/users/auth/reset-password` — accepts email, OTP,
+  and new password; validates the OTP and expiry before updating the
+  password.
+- Log Out: `POST /v1/users/auth/logout` — clears the `access_token` cookie.
+- Delete Account: `DELETE /v1/users/auth` — requires the user's current
+  password for confirmation. On success, sends an "Account Deletion
+  Confirmation" email and permanently deletes the user record (and, via
+  Prisma relations, associated data) from the database. This action is
+  irreversible.
+
+Security notes for the chatbot to know:
+- JWT tokens are stored in an HTTP-only cookie (not accessible to
+  JavaScript), which mitigates XSS token theft.
+- Session/token lifetime is 1 hour before a refresh is needed.
+- There is currently no visible email verification step on signup (no
+  "verify your email" flow was found in the codebase) — signup is
+  immediate.
+- There is no third-party/social login (Google/GitHub OAuth) implemented;
+  only email + password authentication exists.
+
+================================================================================
+4. USER PROFILE MANAGEMENT
+================================================================================
+Backend module: `src/profile` (route prefix: `/v1/users/profile`)
+
+- Update Profile: `PUT /v1/users/profile/update-profile` — lets the user
+  update their display Name, Email, Bio (max 500 characters), and Profile
+  Image URL (typically populated after uploading through the Image Upload
+  endpoint described below).
+- Note: In the frontend Profile page, the Email field is shown but disabled
+  for direct editing, with the hint "Contact support to change your email" —
+  even though the backend DTO technically allows an email field to be
+  passed.
+
+Frontend Profile screen (`/profile`) features:
+- Avatar upload (click-to-upload profile picture): validates that the file
+  is an image and is under 2MB, uploads it to Cloudinary via the Image
+  Upload endpoint, then saves the resulting URL to the user's profile.
+- Editable fields: Display Name, Bio (email is read-only in the UI).
+- "Save Changes" button to persist profile edits.
+- Change Password section: current password, new password, confirm new
+  password, each with a show/hide (eye icon) toggle.
+- "Danger Zone": permanently delete the account, requiring the user to
+  re-enter their password before the delete button becomes enabled.
+- Displays "Joined <Month Year>" based on account creation date.
+
+================================================================================
+5. IMAGE UPLOAD (Cloudinary)
+================================================================================
+Backend module: `src/common/image` (route: `POST /image/upload`)
+
+- Accepts a single multipart/form-data file field named `image`.
+- Validated file types: jpg, jpeg, png, webp, gif.
+- Maximum file size enforced by the API layer: 10MB (NestJS validator), but
+  the underlying Cloudinary upload service enforces a stricter 2MB limit
+  and will reject anything larger with "File too large. Maximum allowed
+  size is 2MB."
+- On success, returns `{ url, publicId }` — a secure Cloudinary CDN URL and
+  the Cloudinary public ID (useful for later deletion).
+- Images are automatically optimized on upload (`quality: auto`,
+  `fetch_format: auto`) to reduce file size while preserving visual quality.
+- Used today specifically for profile picture uploads.
+
+================================================================================
+6. ONBOARDING FLOW (BRAND VOICE SETUP)
+================================================================================
+This is arguably Creatora's signature feature: teaching the AI to write like
+the specific creator, rather than generating generic AI content.
+
+--------------------------------------------------------------------------
+6.1 Step One — Brand Setup (`/onboarding/brand` page, brand tone/niche/audience)
+--------------------------------------------------------------------------
+Backend endpoint: `POST /onboarding/brand`
+Frontend page: two-step progress indicator, Step 1 of 2.
+
+The user selects/enters:
+- Brand Tone (single choice, one of four options with descriptions shown to
+  the user):
+    • Professional — "Clear, authoritative, and business-focused"
+    • Casual — "Friendly, conversational, and relatable"
+    • Inspiring — "Motivational, uplifting, and energizing"
+    • Educational — "Informative, clear, and structured"
+- Niche (free text, e.g., "Tech startups")
+- Target Audience (free text, longer description, e.g., "Early-stage
+  founders and product managers")
+
+This data is saved to (or updates) the user's `BrandProfile` database
+record. All three fields are optional at the database level but required by
+the frontend form before the user can continue.
+
+--------------------------------------------------------------------------
+6.2 Step Two — Upload Past Content Samples (`/onboarding/posts` page)
+--------------------------------------------------------------------------
+Backend endpoints:
+- `POST /onboarding/add-post` — extract & save a single past post from a URL
+- `POST /onboarding/analyze-profile` — analyze all saved posts and build/
+  update the AI writing-style ("Brand Profile") model
+
+How it works:
+1. The user is shown 3 pre-populated post "slots" (defaulting to Twitter,
+   LinkedIn, and Instagram) and can add more via "Add Another Sample Post".
+2. For each slot, the user picks a source platform from: Twitter/X, X
+   Thread, LinkedIn, Instagram, Blog/Article, or Newsletter (email), then
+   pastes the URL of one of their own real past posts.
+3. Clicking "Analyze Post" sends the URL to the backend, which:
+   a. Detects the platform automatically from the URL pattern (also
+      supports Facebook and YouTube URLs even though they are not directly
+      selectable in the current UI dropdown).
+   b. Scrapes the content using the Apify web-scraping platform — separate
+      Apify Actors are used per platform:
+        - Instagram → `apify/instagram-scraper` (caption, media URL, likes,
+          comments, timestamp, author username)
+        - Twitter/X → `apify/twitter-scraper` (falls back to
+          `quacker/twitter-scraper` if the primary actor fails) — captures
+          tweet text, author, likes, retweets, replies, timestamp
+        - LinkedIn, YouTube, Facebook, and generic blogs/websites each have
+          their own dedicated scraping logic (with LinkedIn/Facebook text
+          cleanup for truncated "…see more" text, and generic HTML/text
+          cleanup for blogs)
+        - A generic fallback scraper is used if the primary
+          platform-specific scraper fails, so the flow is resilient to
+          scraping errors.
+   c. Runs a deep AI content analysis on the scraped text using Google's
+      Gemini model (`gemini-2.5-flash`). This analysis produces a detailed
+      structured JSON profile of that single post, including: tone (from a
+      rich vocabulary like Professional, Witty, Satirical, Melancholic,
+      Luxurious, Educational, Urgent, Minimalist, Aspirational, Aggressive,
+      Whimsical), sentiment, 2-4 key abstract themes, writing style
+      (Narrative, Direct, Conversational, Academic, Poetic, Technical),
+      target audience description, call-to-action, hashtags found,
+      mentions found, word count, readability score, primary emotional
+      appeal (FOMO, Nostalgia, Validation, Curiosity, Outrage, Hope,
+      Exclusivity), and a short structural breakdown (e.g. "Hook -> Story
+      -> CTA").
+   d. Saves the raw content, metadata, and this analysis to the database
+      as a "Past Post" record tied to the user.
+4. Once at least 3 posts show "Analyzed Successfully", the "Analyze & Train
+   AI" button becomes enabled. Clicking it triggers `analyze-profile`,
+   which:
+   a. Retrieves ALL of the user's saved past posts (must be at least 3, or
+      the backend returns an error).
+   b. Sends all post contents together to Gemini with a prompt asking it to
+      extract a single, consistent overall "writing voice" fingerprint:
+      style summary, tone (Professional/Casual/Inspiring/Educational),
+      storytelling style (direct/narrative/conversational), humor usage
+      (boolean), vocabulary complexity (simple/moderate/advanced),
+      formality score (0 to 1), emotional tone, common phrases the creator
+      tends to use, topic preferences, and average sentence length.
+   c. This becomes (or updates) the user's persistent "Brand Profile" — the
+      foundation every future piece of generated content is built on.
+5. While training runs, the UI shows a dedicated animated loading screen
+   ("Training Your AI Model... analyzing writing patterns, sentence
+   structures, and tone from N distinct samples... Finalizing semantic
+   analysis...") before redirecting to the Dashboard.
+6. A "Skip setup (Not recommended)" link exists, letting a user bypass
+   onboarding and go straight to the dashboard — but AI content generation
+   features that depend on a Brand Profile will not work until the profile
+   is completed (they return an explicit error telling the user to finish
+   onboarding first).
+
+Note for chatbot: the platform explicitly states past-post data is
+"encrypted and used solely for training your personal model" (per the UI
+copy) — the chatbot should present this framing if a user asks about data
+privacy during onboarding, without over-claiming security details that
+aren't verifiable from the code alone.
+
+================================================================================
+7. BRAND PROFILE (THE AI "VOICE MODEL")
+================================================================================
+This is a database record (`BrandProfile`) unique per user, containing:
+- niche, audience, tone (enum: PROFESSIONAL / CASUAL / INSPIRING /
+  EDUCATIONAL)
+- AI-generated styleSummary (plain-language description of their voice)
+- avgSentenceLength, vocabularyComplexity (simple/moderate/advanced)
+- commonPhrases (list of phrases they tend to repeat)
+- emotionalTone, formalityScore (0–1 scale)
+- humorUsage (boolean)
+- storytellingStyle (direct/narrative/conversational)
+- topicPreferences (list of topics they gravitate to)
+
+Every downstream AI generation feature (Content Ideas, Post Generation,
+Weekly Planner) reads from this Brand Profile so the output matches the
+creator's real voice rather than generic AI-sounding text. If a user has
+not completed onboarding (no Brand Profile exists), attempts to use Ideas
+generation, Post generation, or Weekly Planning will fail with a clear
+error asking them to complete their brand profile first.
+
+================================================================================
+8. DASHBOARD (HOME SCREEN)
+================================================================================
+Frontend route: `/dashboard`
+Backend data source: `GET /v1/users/auth/me`
+
+What it shows:
+- Personalized greeting/header using the user's name.
+- Four key stat cards:
+    1. "Total Posts Generated" — lifetime count of AI-generated posts.
+    2. "Remaining Credits" — (creditsLimit − creditsUsed), with the total
+       limit shown as a subtext (e.g., "of 50").
+    3. "Current Plan" — the user's subscription plan (FREE / CREATOR /
+       PRO).
+    4. "Posts Generated This Month" — count of posts created in the
+       current calendar month.
+- Brand Profile summary card (niche, tone, audience, style highlights).
+- Weekly Planner preview widget (a lightweight glance at the current week's
+  planned posts / posting cadence).
+- Quick Actions panel (shortcuts to Generate Post, Content Ideas, Weekly
+  Planner, etc.).
+- Recent Posts list — the 3 most recently generated posts, each showing
+  platform, a short content preview, and relative time (e.g., "2 hours
+  ago"). Clicking a recent post opens a Post Detail modal with the full
+  content.
+
+Credits system: Every user starts on the FREE plan with a default limit of
+50 generation credits (`creditsLimit`, `creditsUsed` fields on the User
+model). Each successful "Generate Post" call consumes 1 credit. If
+`creditsUsed >= creditsLimit`, further generation requests are blocked with
+a "Credit limit reached" error until the limit is reset/increased (e.g. by
+upgrading plans).
+
+================================================================================
+9. CONTENT IDEAS (`/ideas`)
+================================================================================
+Backend module: `src/ideas-generation` (route prefix: `/ideas`)
+
+This screen has three sections:
+
+9.1 AI Generated Ideas
+- Button: "Generate New AI Ideas" → `POST /ideas/generate`
+- Uses the user's Brand Profile (niche, audience, tone, storytelling style)
+  and asks Gemini (`gemini-2.5-flash`) to produce exactly 15 highly
+  specific content ideas in one batch, following a deliberate content-mix
+  formula:
+    • 4 Reels / TikTok-style short-form video ideas (under 60 seconds)
+    • 3 Carousel post ideas (multi-slide educational/storytelling)
+    • 2 Talking-head / POV video ideas
+    • 2 Behind-the-scenes / Day-in-the-life ideas
+    • 2 "Trend hijack" ideas (adapting a current trend/audio/challenge to
+      the creator's niche)
+    • 2 Story / Poll / interactive post ideas
+- Each idea includes: a title, a scroll-stopping hook (first 2 seconds),
+  a 60-100 word description of the concept/story/why it will resonate/
+  execution tips, the format, the unique narrative "angle", and a
+  suggested call-to-action.
+- All generated ideas are saved to the database tagged `source: "AI"`.
+
+9.2 Trending Ideas
+- Button: "Generate Trending Ideas" → `GET /ideas/trending`
+- Calls an external, separately-hosted generative model service
+  (Creatora's own "idea generation" microservice) that factors in the
+  user's full Brand Profile (niche, audience, style summary, average
+  sentence length, common phrases, emotional tone, formality score, humor
+  usage, storytelling style, topic preferences, vocabulary complexity,
+  tone) and requests 10 trending ideas informed by current platform trends
+  (the ContentIdea schema supports fields like `trendSource` — e.g. Reddit,
+  YouTube, Instagram — and `trendTitle`, suggesting the underlying model is
+  designed to surface ideas based on real trending topics/sounds on those
+  platforms).
+- Saved to the database tagged `source: "TRENDING"`.
+
+9.3 Your Favorites
+- Any idea (AI or Trending) can be "favorited" by clicking its heart icon,
+  via `POST /ideas/favorite` (toggles favorite status).
+- `GET /ideas/favorites` returns all of a user's favorited ideas, newest
+  first. This same favorites list feeds directly into the Weekly Planner
+  (see Section 10) as a pool of ideas the user can schedule for specific
+  days.
+- Clicking any idea card (in any of the three sections) opens a detail
+  dialog showing the full idea (hook, description, format, angle, CTA,
+  platform, trend source if applicable) with a favorite toggle inside the
+  dialog too.
+
+================================================================================
+10. GENERATE POST (`/generate`) — SINGLE-POST AI GENERATION
+================================================================================
+Backend module: `src/content-generation` (route prefix: `/content-generation`,
+JWT-protected)
+
+This is the flagship "one-click content generation" feature, currently
+built around Instagram as the primary output format.
+
+10.1 Generating content — `POST /content-generation/generate`
+- Requires the user to already have a completed Brand Profile and at least
+  1 remaining credit.
+- The backend gathers the user's Brand Profile + all their Past Posts, and
+  sends this context to an external FastAPI microservice
+  ("creatora-fast-api-post-generation", a separate deployed service) at its
+  `/generate-post` endpoint.
+- That service returns three parallel content variants for the SAME
+  underlying idea, all matched to the creator's brand voice:
+    1. TEXT variant — a caption + hashtags (platform-agnostic short text
+       post).
+    2. IMAGE variant — a caption, hashtags, an AI-generated image prompt,
+       and a generated image URL (ready to be used as an Instagram feed
+       post).
+    3. VIDEO variant — a hook line, caption, full voiceover script, general
+       shooting instructions, an audience-engagement question, and
+       hashtags (this becomes the source data for the Video Script feature
+       below).
+- The result is saved to the database as a `GeneratedPost` record (the raw
+  JSON of all three variants is stored as the post's content), 1 credit is
+  deducted from the user, and the frontend receives a formatted "Instagram
+  Preview" object simulating how the post would look in an Instagram feed
+  (username, avatar, post image, caption, hashtags, and — importantly —
+  mock/randomized like & comment counts purely for visual preview purposes,
+  NOT real Instagram engagement data).
+
+10.2 On the Generate screen, once content is generated, the user can:
+- View an Instagram-style live preview card of the generated image post.
+- "Download Image" — downloads the generated image file directly to their
+  device.
+- "Copy Caption" — copies the caption + hashtags to the clipboard as one
+  block of text.
+- "Post to Instagram" (helper flow) — this does NOT auto-post via any
+  Instagram API integration (Creatora has no official Instagram Graph API
+  connection for automatic publishing). Instead, it is a convenience flow
+  that: (1) auto-downloads the generated image, (2) copies the caption to
+  the clipboard, and (3) opens Instagram (either the native app via a deep
+  link on mobile, or Instagram's web "create post" page on desktop) so the
+  user can manually select the downloaded image and paste the caption
+  themselves.
+- "View Video Script" — fetches `GET /content-generation/:postId/video-
+  script`, which breaks the raw video hook/script/CTA into a structured,
+  numbered shooting script (see 10.3).
+- "View Posting Schedule" — fetches `GET /content-generation/:postId/
+  posting-schedule`, an AI-generated recommendation on exactly when to post
+  this content (see 10.4).
+- "Regenerate" — runs generation again for a brand-new variant (also
+  consumes another credit).
+
+10.3 Video Script breakdown
+The raw AI video script is automatically parsed into a scene-by-scene
+shooting guide:
+- Scene 1 is always the "Opening Hook" (~3 seconds, close-up shot type,
+  with concrete shooting tips like "use good lighting, ensure audio is
+  clear, start with energy").
+- The middle of the script is automatically split into up to 3 "Main
+  Content" scenes (~8 seconds each), cycling through shot types (medium,
+  b-roll, wide) and providing scene-specific visual notes (e.g., "b-roll
+  footage of product in use", "wide shot showing context/environment").
+- The final scene is always a "Call to Action" scene (~4 seconds,
+  talking-head shot type) using the audience-engagement question as the
+  voiceover, with shooting tips like "be energetic, make eye contact with
+  camera, smile".
+- Total video duration is automatically summed from all scene durations
+  and displayed (e.g., "0:25").
+- The response also separately includes the full caption and hashtag set
+  intended for the video post.
+
+10.4 AI Posting Schedule
+Uses Gemini (`gemini-2.0-flash-exp`) with the user's Brand Profile (niche,
+audience, tone) and today's date to recommend:
+- The best specific date/day-of-week/time-window to post the IMAGE variant,
+  with a stated reason (e.g., "Evening hours see 40% higher engagement for
+  food/lifestyle content").
+- The best specific date/day/time-window to post the VIDEO variant.
+- The recommended GAP between the two posts (in days/hours) with reasoning
+  (to avoid over-posting/spamming followers).
+- A suggestion for the user's NEXT piece of content after these two (what
+  content type, when, and why).
+- A general "Best Posting Times" table broken down by day of week, each
+  with recommended time slots and an engagement-level label (High / Very
+  High / Medium).
+- If the Gemini call fails or returns invalid data, the backend falls back
+  to a sensible hardcoded default schedule (tomorrow for the image post,
+  a couple of days later for video, evening/lunch time slots) so the
+  feature never simply breaks for the user.
+
+================================================================================
+11. GENERATED POSTS LIBRARY (`/generated-posts`)
+================================================================================
+Backend endpoints (route prefix: `/v1/users/generated-posts`):
+- `GET /v1/users/generated-posts` — paginated list of every post the user
+  has ever generated. Supports:
+    • `search` — free-text search
+    • `sort` — `asc` or `desc`
+    • `orderBy` — field to sort by (e.g. `createdAt`, `platform`)
+    • `page` / `limit` — standard pagination (frontend defaults to 9 posts
+      per page)
+- `GET /v1/users/generated-posts/:id` — fetch one specific generated post
+  by its ID.
+
+Frontend features on this screen:
+- A search box (debounced ~400ms before triggering a new search) to filter
+  posts by content.
+- Prev/Next pagination controls with a "Page X of Y (Z total)" indicator.
+- A responsive grid of Post Cards, each rendering the generated content
+  (parsed from the stored JSON) in a readable preview format.
+- Empty state: if the user has never generated anything, shows a friendly
+  "No Posts Yet" message with a direct "Generate Your First Post" button
+  linking to `/generate`.
+
+================================================================================
+12. WEEKLY PLANNER (`/planner`)
+================================================================================
+Backend module: `src/weekly-planner` (route prefix: `/planner`, all routes
+JWT-protected)
+
+This is Creatora's content-calendar / scheduling-assistant feature. It is
+NOT a social-media auto-publishing tool (no posts are actually pushed to
+any platform automatically) — it is an AI-assisted planning board that
+helps the creator decide what to post, when, across the week, and track
+whether they actually posted it.
+
+12.1 Generating a weekly plan
+- `POST /planner/generate` — body can optionally include a `weekStart` date
+  (YYYY-MM-DD); if omitted, it defaults to the Monday of the current week.
+- The backend gathers, in parallel: the user's Brand Profile, all of the
+  user's FAVORITED content ideas (from the Ideas screen), and their 10 most
+  recent generated posts.
+- It builds a detailed prompt (via a dedicated prompt-builder,
+  `plan-generator.prompt.ts`) and calls Gemini (`gemini-2.5-flash`, JSON
+  response mode, temperature 0.7) to produce a full 7-day content plan.
+- The plan (Prisma model `WeeklyPlan`) is uniquely keyed per user per
+  `weekStart` — regenerating for a week that already has a plan overwrites
+  it ("regenerate the weekly plan").
+- The AI-produced plan JSON includes:
+    • A one-sentence overall `summary`/rationale for the week's strategy.
+    • A list of `posts` (scheduled slots), each with:
+        - day of week (0=Monday … 6=Sunday)
+        - a specific scheduled time (24-hour "HH:MM")
+        - target platform (Twitter, LinkedIn, Instagram, Facebook,
+          YouTube, Blog, Email, or Thread)
+        - content format (Reel, Carousel, Talking-head, BTS, Trend
+          hijack, Story/Poll, POV, Behind-the-scenes, Day-in-the-life, or
+          a custom string)
+        - a title and caption
+        - hashtags
+        - a link back to the source ContentIdea (if the slot was built
+          from one of the user's favorited ideas) or to an existing
+          GeneratedPost (if reusing prior content)
+        - a status: SCHEDULED, POSTED, or SKIPPED
+        - an AI-written rationale explaining WHY this slot/time/format was
+          chosen
+    • A list of `reminders` — supporting tasks tied to specific days/times,
+      each typed as HARVEST (e.g., "capture footage/content today"),
+      ENGAGEMENT_CHECK (e.g., "reply to comments on yesterday's post"),
+      CONTENT_PREP, or GENERAL, with a title and description.
+    • `unscheduledIdeaIds` — any of the user's favorited ideas that the AI
+      deliberately did NOT place into this week's plan (kept available for
+      manual scheduling — see the Unscheduled Ideas panel below).
+- Built-in platform/format "best posting window" heuristics (a
+  hand-tuned lookup table in `schedule-optimizer.ts`) act as a soft
+  constraint that guides (but doesn't strictly force) the AI's time
+  choices — e.g., Instagram Reels default to Monday/Thursday mornings,
+  LinkedIn posts default to Monday/Wednesday at 8:00 AM, Threads default to
+  Monday/Thursday evenings, etc. The AI can override these defaults when it
+  has good contextual reason to.
+- The backend defends against malformed AI output: it strips accidental
+  markdown code fences, detects clearly truncated JSON and asks the user to
+  regenerate rather than silently corrupting data, and guarantees every
+  post/reminder gets a valid unique ID even if the AI omitted one.
+
+12.2 Viewing and navigating plans
+- `GET /planner/:weekStart` — fetch the plan for a specific week (e.g.
+  `2026-05-19`). Returns 404 if no plan has been generated for that week
+  yet, in which case the frontend shows an "Empty Planner State" inviting
+  the user to generate one.
+- `GET /planner/by-id/:planId` — fetch a plan directly by its database ID.
+- `GET /planner/history` — returns ALL of a user's previously generated
+  weekly plans, newest first, shown in a "History" dialog so users can jump
+  back to any past week's plan.
+- The frontend Planner screen has Prev Week / Next Week / "Today" (jump to
+  current week) navigation controls, and displays the current week's date
+  range as a label at the top.
+
+12.3 Managing individual scheduled slots
+- `PATCH /planner/:planId/slots/:slotId` — edit any field of an existing
+  slot (day, time, platform, title, caption, hashtags, status).
+- `PATCH /planner/:planId/slots/:slotId/posted` — one-click shortcut to
+  mark a slot as POSTED.
+- `PATCH /planner/:planId/slots/:slotId/skipped` — one-click shortcut to
+  mark a slot as SKIPPED (the user chose not to post it).
+- `POST /planner/:planId/slots` — manually add a brand-new post slot to an
+  existing plan (not AI-generated — user-authored), optionally pre-filled
+  from one of their favorited-but-unscheduled ideas.
+- `DELETE /planner/:planId/slots/:slotId` — remove a slot entirely.
+
+12.4 Planner UI layout
+- A 7-day week grid (Monday through Sunday) showing each day's scheduled
+  post cards and reminder cards.
+- Each post card shows platform, format, time, title/caption snippet, and
+  status, with quick actions to edit, delete, mark posted, or mark skipped.
+- A right-hand sidebar panel shows:
+    • "Unscheduled Ideas" — favorited ideas the AI didn't place this week;
+      clicking one opens the Add-Slot modal pre-filled with that idea's
+      details so the user can manually schedule it into any day.
+    • "Reminders" — the week's AI-generated reminder tasks.
+- "Add Slot" and "Edit Slot" are both presented as modal dialogs.
+- A loading skeleton is shown while a plan is being fetched, and a
+  dedicated empty-state screen is shown when no plan exists yet for the
+  selected week, with a prominent "Generate Plan" call-to-action.
+
+================================================================================
+13. ACCOUNT & BILLING (`/account`) — CURRENTLY STATIC / MOCK DATA
+================================================================================
+IMPORTANT FOR THE CHATBOT: As implemented in the current codebase, the
+entire Account & Billing screen is a FRONT-END-ONLY MOCKUP. It is NOT wired
+up to any real payment processor (no Stripe/Paddle/Razorpay integration was
+found in either repository) and does NOT reflect a user's real usage or
+plan in real time. Specifically, in the current source code:
+- The displayed "Current Plan" (shown as "Pro", $49/month), its feature
+  list, "Next billing date", and the "Cancel Subscription" button are all
+  hardcoded placeholder values in the frontend component — clicking these
+  buttons does not call any backend endpoint.
+- The "Payment Method" card (showing a fake VISA card ending in 4242,
+  expiring 12/26) is static placeholder UI.
+- The "Usage This Month" statistics (Posts Generated: 47, Ideas Generated:
+  23, Storage Used: 2.3GB of 10GB) are hardcoded sample numbers, not the
+  authenticated user's real usage.
+- The "Billing History" table (Dec/Nov/Oct/Sep invoices) is a hardcoded
+  sample list, not real transaction records.
+The chatbot should NOT tell users they can actually upgrade their plan,
+update payment methods, or download real invoices from this screen today —
+it should clarify this page currently shows example/demo data if a user
+asks about billing specifics, and should direct real plan/credit questions
+back to the Dashboard's "Remaining Credits" and "Current Plan" stat cards,
+which DO reflect real database values (`plan`, `creditsUsed`,
+`creditsLimit` on the User model).
+
+Real subscription plan tiers that DO exist at the data-model level:
+- FREE (default plan for all new sign-ups, 50 credits by default)
+- CREATOR
+- PRO
+(There is currently no visible backend endpoint to actually change a user's
+plan/tier — this appears to be a planned/future feature.)
+
+================================================================================
+14. SIDEBAR NAVIGATION SUMMARY
+================================================================================
+Main navigation (top section):
+- Dashboard → /dashboard
+- Content Ideas → /ideas
+- Generate Post → /generate
+- Generated Posts → /generated-posts
+- Weekly Planner → /planner
+
+Bottom navigation:
+- Profile → /profile
+- Account → /account
+- Log out (clears the session cookie and redirects to the homepage)
+
+The sidebar can be collapsed/expanded (icon-only vs. icon+label) via a
+toggle button at the top.
+
+================================================================================
+15. MARKETING / LANDING PAGE (PUBLIC, UNAUTHENTICATED)
+================================================================================
+The public homepage (https://creatora-frontend.vercel.app/) is composed of:
+1. Hero Section — main headline/value proposition and primary sign-up call
+   to action.
+2. Features Section — six headline features presented to visitors:
+   - "Learn Your Voice" — upload past content so Creatora learns unique
+     writing style, tone, and personality.
+   - "Generate On-Brand" — content that sounds authentically like the
+     creator, not generic AI output.
+   - "Weekly Planning" — plan a content calendar with AI-suggested topics
+     and optimal posting times.
+   - "Platform Optimized" — content tailored per platform (Twitter threads,
+     LinkedIn posts, blog articles, etc.).
+   - "Lightning Fast" — generate weeks of content in minutes; beat writer's
+     block.
+   - "Engagement Insights" — track what resonates with the audience and
+     refine strategy.
+   (Note: "Engagement Insights"/analytics as a dedicated dashboard is
+   marketing copy on the landing page; a full analytics/insights feature
+   was not found as a distinct implemented screen in the current dashboard
+   — the closest real equivalent today is the Dashboard's stat cards and
+   the AI-generated "posting schedule" reasoning.)
+3. How It Works Section — a simplified step-by-step explainer of the
+   onboarding → generation workflow described in Section 2/6 above.
+4. Pricing Section — presents the product's pricing tiers/plans to
+   visitors (mirrors the FREE/CREATOR/PRO plan concept).
+5. CTA (Call To Action) Section — final sign-up prompt before the footer.
+6. Footer and Navbar are present site-wide.
+
+Auth-related public pages:
+- `/login` — email + password login form, with a link to
+  `/forgot-password`.
+- `/signup` — account creation form (name, email, password).
+- `/forgot-password` — request an OTP reset email by entering an account
+  email address.
+
+================================================================================
+16. TECHNICAL ARCHITECTURE (FOR REFERENCE / SUPPORT CONTEXT)
+================================================================================
+Backend:
+- Framework: NestJS 11 (Node.js, TypeScript), versioned REST API (`v1`
+  prefix on most user-facing auth/profile/posts routes).
+- Database: PostgreSQL, accessed via Prisma ORM 6.
+- Authentication: JWT (via @nestjs/jwt + passport-jwt strategy), delivered
+  as an HTTP-only cookie.
+- AI providers used:
+    • Google Gemini (`@google/generative-ai` SDK) — models referenced in
+      code: `gemini-2.5-flash` (content analysis, ideas, weekly planning)
+      and `gemini-2.0-flash-exp` (posting schedule generation).
+    • An external, separately hosted FastAPI microservice dedicated to
+      generating the actual Instagram post assets (text/image/video
+      variants), reachable at a Vercel-hosted URL referenced in the code as
+      `creatora-fast-api-post-generation`.
+    • An external, separately hosted "trending idea generation" GenAI
+      microservice, reachable at a Render-hosted URL referenced in the code
+      as `creatora-idea-genration-genai-model`.
+- Web scraping: Apify platform (`apify-client` SDK) with dedicated Actors
+  per social platform (Instagram, Twitter/X — with a fallback actor), plus
+  custom scraping/cleanup logic for LinkedIn, YouTube, Facebook, and
+  generic blog/website URLs (using `cheerio` for HTML parsing), with a
+  final generic fallback scraper if the primary method errors.
+- Transactional email: Brevo (`@getbrevo/brevo` SDK) — used for password
+  reset OTP emails and account deletion confirmation emails.
+- Image storage/CDN: Cloudinary.
+- API documentation: Swagger/OpenAPI, auto-generated and served at the
+  `/docs` path of the backend (interactive "try it out" UI).
+- Deployment: Backend is deployed on Render
+  (creatora-backend.onrender.com); configuration files in the repo also
+  reference Railway and Nixpacks as alternative/additional deployment
+  targets.
+
+Frontend:
+- Framework: Next.js 16 (App Router) with React 19.
+- Styling: Tailwind CSS v4, a custom design system with "glass card" UI
+  components, gradient theming, and Radix UI primitives (Dialog, Slot,
+  etc.) styled in a shadcn/ui-like pattern.
+- HTTP client: Axios, with `withCredentials: true` on requests so the
+  HTTP-only auth cookie is sent automatically.
+- Notifications: `sonner` toast library for success/error feedback
+  throughout the app.
+- Icons: `lucide-react`.
+- Deployment: Vercel (creatora-frontend.vercel.app).
+
+Data model summary (Prisma schema, PostgreSQL):
+- User — core account (email, password hash, name, bio, credits, plan,
+  profile image, active flag, password-reset OTP fields, timestamps).
+- BrandProfile — one-to-one with User; stores the AI-derived "voice"
+  fingerprint described in Section 7.
+- SocialAccount — per-platform connected account metadata (platform,
+  username, followers, engagement rate, post frequency, connection status,
+  last synced time) — supports TWITTER, LINKEDIN, INSTAGRAM, FACEBOOK,
+  YOUTUBE, BLOG, EMAIL, THREAD. (Note: this model exists in the schema to
+  support future "connect your social accounts" functionality; no backend
+  controller for connecting/syncing social accounts was found active in
+  the current codebase — it appears to be a planned feature.)
+- PastPost — a past piece of content the user submitted during onboarding,
+  including scraped content, platform, author, media URL, and the detailed
+  Gemini analysis JSON.
+- ContentIdea — an AI or trending content idea (title, hook, description,
+  format, angle, cta, platform, source, trend metadata, favorite flag).
+- GeneratedPost — a single AI-generated post record (its content stored as
+  a JSON blob containing the text/image/video variants), linked optionally
+  to the ContentIdea it was based on.
+- WeeklyPlan — one plan per user per week-start date, storing the entire
+  week's posts/reminders/unscheduled-idea-ids as a JSON blob.
+
+================================================================================
+17. KNOWN LIMITATIONS / THINGS THE CHATBOT SHOULD BE CAREFUL ABOUT
+================================================================================
+- There is NO native, automatic publishing integration with Instagram,
+  LinkedIn, Twitter/X, Facebook, YouTube, or any other platform. "Posting"
+  from Creatora is always a manual, user-driven action; the "Post to
+  Instagram" button is a convenience helper (download image + copy caption
+  + open Instagram) rather than a true API-based auto-publish.
+- The Account & Billing page is demo/mock data only (see Section 13) — do
+  not claim real payments, invoices, or plan upgrades happen there today.
+- "Connect your social accounts" (the `SocialAccount` data model) does not
+  currently have an active, user-facing connection flow in the codebase
+  reviewed — treat this as a schema that exists for a feature not yet
+  fully built/exposed, rather than confirming it as a live feature.
+- Content generation (`/content-generation/generate`) currently always
+  targets Instagram-style assets in the frontend Generate screen; while the
+  Brand Profile and prompts are platform-agnostic in principle, the
+  polished "Generate Post" single-click experience in the UI today is
+  built specifically around an Instagram feed-post format (image + caption
+  + hashtags) plus an associated video/reel script.
+- AI outputs (ideas, posts, schedules, plans) are generated by large
+  language models and, like any AI system, can occasionally produce
+  imperfect, generic, or inaccurate suggestions; the backend includes
+  fallback logic for parsing failures precisely because AI JSON output is
+  not 100% guaranteed to be well-formed.
+- Email verification on signup does not appear to be implemented; accounts
+  are active immediately after signup.
+================================================================================
+END OF DOCUMENT
+================================================================================
