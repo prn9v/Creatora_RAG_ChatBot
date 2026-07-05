@@ -213,8 +213,8 @@ async def chat(req: ChatRequest):
 
         full_prompt = f"{history_text}USER: {req.question}"
 
-        delay = 5
-        max_retries = 3
+        delay = 2
+        max_retries = 6
         last_error = None
         for attempt in range(max_retries):
             try:
