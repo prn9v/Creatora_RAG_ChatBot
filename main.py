@@ -29,7 +29,7 @@ if not GEMINI_API_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 EMBEDDING_MODEL = "models/gemini-embedding-001"  # current embedding model (text-embedding-004 was shut down)
-CHAT_MODEL = "gemini-2.5-flash-lite"             # current free-tier model (gemini-2.0-flash was shut down)
+CHAT_MODEL = "gemini-2.5-flash"             # current free-tier model (gemini-2.0-flash was shut down)
 
 DOC_PATH = Path("docs/project_details.txt")
 CACHE_PATH = Path("docs/embeddings_cache.json")
